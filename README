@@ -21,8 +21,8 @@
 ### Клонирование репозитория
 
 ```bash
-git clone <URL_репозитория>
-cd <папка_с_репозиторием>
+git clone https://github.com/Popachka/async-wildberries-parser.git
+cd async-wildberries-parser
 ```
 
 ### Установка зависимостей
