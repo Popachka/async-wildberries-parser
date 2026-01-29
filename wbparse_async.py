@@ -40,7 +40,6 @@ class AsyncWbParser:
     async def create(cls) -> "AsyncWbParser":
         self = cls()
         self.cookies, self.user_agent = await self._get_token_static()
-        logger.info(f"User-Agent: {self.user_agent}")
         limits = httpx.Limits(max_keepalive_connections=16, max_connections=30)
         self.client = httpx.AsyncClient(http2=True, limits=limits, headers={
                                         "User-Agent": self.user_agent}, cookies=self.cookies, timeout=10.0)
@@ -150,10 +149,8 @@ class AsyncWbParser:
 
             res_json, found_basket = await self._fetch_basket(url, basket_str)
             if res_json:
-                logger.info(f"✓ SKU {sku} найден на basket-{basket_str}")
                 return res_json, found_basket
 
-        logger.warning(f"✗ SKU {sku}: не найден на basket-серверах")
         return None, ""
 
     def generate_image_urls(self, sku: int, pics_count: int, basket_str: str) -> str:
@@ -200,9 +197,6 @@ class AsyncWbParser:
             response = await self.client.get(url, timeout=1)
             if response.status_code == 200:
                 return response.json(), basket_str
-        except asyncio.CancelledError:
-            logger.debug(f"✗ basket-{basket_str} отменена")
-            raise
         except Exception:
             pass
         return None, None
