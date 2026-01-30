@@ -40,7 +40,7 @@ class AsyncWbParser:
     async def create(cls) -> "AsyncWbParser":
         self = cls()
         self.cookies, self.user_agent = await self._get_token_static()
-        limits = httpx.Limits(max_keepalive_connections=16, max_connections=30)
+        limits = httpx.Limits(max_keepalive_connections=30, max_connections=1000)
         self.client = httpx.AsyncClient(http2=True, limits=limits, headers={
                                         "User-Agent": self.user_agent}, cookies=self.cookies, timeout=10.0)
         return self
