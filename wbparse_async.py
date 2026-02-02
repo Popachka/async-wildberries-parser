@@ -7,8 +7,94 @@ from tqdm.asyncio import tqdm
 import asyncio
 import httpx
 from typing import Optional, Tuple, Any
+from pydantic import BaseModel, Field, field_validator
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.ERROR)
+
+# Data models
+
+
+class WBPrice(BaseModel):
+    product: int = 0
+    basic: int = 0
+
+
+class WBSize(BaseModel):
+    name: str = ""
+    wh: int = 0
+    price: Optional[WBPrice] = None
+
+
+class WBProduct(BaseModel):
+    """Model product from raw search"""
+    id: int
+    name: str = "Без названия"
+    supplier: str = "Неизвестный продавец"
+    supplierId: int = 0
+    reviewRating: float = 0.0
+    feedbacks: int = 0
+    totalQuantity: int = 0
+    pics: int = 0
+    sizes: list[WBSize] = Field(default_factory=list)
+
+    description: str = ""
+    characteristics: str = ""
+    country: str = "Не указано"
+    image_urls: str = ""
+    
+    def generate_images(self, basket_str: str):
+        """Генерирует строку со ссылками на фото"""
+        if not self.pics or not basket_str:
+            return ""
+        vol = self.id // 100000
+        part = self.id // 1000
+        base_url = f"https://basket-{basket_str}.wbbasket.ru/vol{vol}/part{part}/{self.id}/images/big"
+        links = [f"{base_url}/{i}.webp" for i in range(1, self.pics + 1)]
+        self.image_urls = ", ".join(links)
+    
+    @property
+    def sku(self) -> int:
+        return self.id
+
+    def get_price(self) -> float:
+        for size in self.sizes:
+            if size.wh > 0 and size.price:
+                return (size.price.product or size.price.basic) / 100
+        return 0.0
+
+    def get_sizes_str(self) -> str:
+        return ", ".join([s.name for s in self.sizes if s.name])
+    def to_excel_dict(self):
+        return {
+            "link": f"https://www.wildberries.ru/catalog/{self.id}/detail.aspx",
+            "sku": self.id,
+            "name": self.name,
+            "price": self.get_price(),
+            "description": self.description,
+            "image_urls": self.image_urls,
+            "characteristics": self.characteristics,
+            "seller_name": self.supplier,
+            "seller_link": f"https://www.wildberries.ru/seller/{self.supplierId}",
+            "sizes": self.get_sizes_str(),
+            "total_stocks": self.totalQuantity,
+            "rating": self.reviewRating,
+            "feedbacks": self.feedbacks,
+            "country": self.country
+        }
+
+class WBOption(BaseModel):
+    name: str = ""
+    value: str = ""
+
+
+class WBGroupedOption(BaseModel):
+    group_name: str = ""
+    options: list[WBOption] = Field(default_factory=list)
+
+
+class WBDetailProduct(BaseModel):
+    description: str = ""
+    grouped_options: list[WBGroupedOption] = Field(default_factory=list)
 
 
 class AsyncWbParser:
@@ -40,7 +126,8 @@ class AsyncWbParser:
     async def create(cls) -> "AsyncWbParser":
         self = cls()
         self.cookies, self.user_agent = await self._get_token_static()
-        limits = httpx.Limits(max_keepalive_connections=30, max_connections=1000)
+        limits = httpx.Limits(
+            max_keepalive_connections=30, max_connections=1000)
         self.client = httpx.AsyncClient(http2=True, limits=limits, headers={
                                         "User-Agent": self.user_agent}, cookies=self.cookies, timeout=10.0)
         return self
@@ -49,108 +136,64 @@ class AsyncWbParser:
         if self.client:
             await self.client.aclose()
 
-    async def search_raw_data(self, query: str, page: int, retry: int = 3) -> Optional[dict]:
+    async def search_products_catalog(self, query: str, page: int, retry: int = 3) -> list[WBProduct]:
         params = self.DEFAULT_PARAMS.copy()
-        params['query'] = query
-        params['page'] = str(page)
+        params.update({"query": query, "page": str(page)})
+
         for attempt in range(1, retry + 1):
             try:
                 resp = await self.client.get(self.SEARCH_URL, params=params)
-            except (httpx.RequestError, httpx.TimeoutException) as e:
-                logger.warning(
-                    "search_raw_data request error: %s (attempt %d)", e, attempt)
-                await asyncio.sleep(0.5 * attempt)
-                continue
-
-            if resp.status_code == 498:
-                logger.warning(
-                    "token expired, refreshing (attempt %d)", attempt)
-                await self._refresh_token()
-                continue
-            if resp.status_code != 200:
-                logger.error("search_raw_data HTTP %d", resp.status_code)
-                return None
-            try:
-                return resp.json()
+                if resp.status_code == 498:
+                    logger.warning(
+                        "token expired, refreshing (attempt %d)", attempt)
+                    await self._refresh_token()
+                    continue
+                if resp.status_code != 200:
+                    return []
+                data = resp.json()
+                products = data.get("products", [])
+                return [WBProduct.model_validate(p) for p in products]
             except Exception as e:
-                logger.error("JSON parse error: %s", e)
-                return None
-        return None
+                logger.warning(f"Attempt {attempt} failed: {e}")
+                await asyncio.sleep(0.5)
+        return []
 
-    async def search_all_data(self, query: str) -> list[dict]:
-        page = 1
-        all_products: list[dict] = []
-        empty_pages_in_a_row = 0
-        max_empty_pages = 20
+    async def search_all_products(self, query: str, max_pages: Optional[int] = None) -> list[WBProduct]:
+        page, all_products,  = 1, []
+        empty_pages_in_a_row, max_empty = 0, 5
         with tqdm(desc=f"Сбор товаров по '{query}'", unit="page") as pbar:
             while True:
-                raw_data = await self.search_raw_data(query, page)
-                products = raw_data.get("products", []) if raw_data else []
-
+                products = await self.search_products_catalog(query, page)
+                
                 if len(products) == 0:
                     empty_pages_in_a_row += 1
+                    if empty_pages_in_a_row >= max_empty:
+                        logger.info(f"Поиск завершен: {max_empty} пустых страниц подряд.")
+                        break
                 else:
                     empty_pages_in_a_row = 0
-
-                if empty_pages_in_a_row >= max_empty_pages:
-                    break
-
-                all_products.extend(products)
+                    all_products.extend(products)
                 page += 1
                 pbar.update(1)
+                if max_pages and max_pages == page:
+                    break
                 await asyncio.sleep(0.2)
         return all_products
 
-    def extract_products(self, raw_data: list[dict]) -> list[dict]:
-        extracted_data = []
-        for prod in raw_data:
-            sku = prod.get("id")
-            
-            sizes = prod.get("sizes", [])
-            first_available_size = next((s for s in sizes if s.get("wh", 0) > 0), None)
-            price_raw = None
-            if first_available_size:
-                price_raw = first_available_size.get('price', {}).get('product') \
-                            or first_available_size.get('price', {}).get('basic')
-            all_sizes = ", ".join([str(s.get("name"))
-                                  for s in sizes if s.get("name")])
-            item = {
-                "link": f"https://www.wildberries.ru/catalog/{sku}/detail.aspx",
-                "sku": sku,
-                "name": prod.get('name'),
-                "price": price_raw / 100,
-                "sizes": all_sizes,
-                "rating": prod.get('reviewRating'),
-                "feedbacks": prod.get('feedbacks'),
-                "seller_name": prod.get('supplier'),
-                "seller_link": f"https://www.wildberries.ru/seller/{prod.get('supplierId')}",
-                "total_stocks": prod.get('totalQuantity'),
-                "pics_count": prod.get('pics'),
-
-                "description": "",
-                "characteristics": {},
-                "country": ""
-            }
-            extracted_data.append(item)
-        return extracted_data
-
-    async def get_detail_product(self, sku: int) -> Tuple[Optional[dict], str]:
-        vol = sku // 100000
-        part = sku // 1000
+    async def get_detail_product(self, sku: int) -> tuple[Optional[WBDetailProduct], str]:
+        vol, part = sku // 100000, sku // 1000
         base_basket = self._get_basket_id(sku)
         offsets = list(dict.fromkeys([i for j in range(15) for i in (j, -j)]))
 
         for offset in offsets:
-            basket_num = base_basket + offset
-            if basket_num < 1:
-                continue
-            basket_str = f"{basket_num:02d}"
+            basket_str = f"{base_basket + offset:02d}"
             url = f"https://basket-{basket_str}.wbcontent.net/vol{vol}/part{part}/{sku}/info/ru/card.json"
-
-            res_json, found_basket = await self._fetch_basket(url, basket_str)
-            if res_json:
-                return res_json, found_basket
-
+            try:
+                res = await self.client.get(url, timeout=1)
+                if res.status_code == 200:
+                    return WBDetailProduct.model_validate(res.json()), basket_str
+            except:
+                continue
         return None, ""
 
     def generate_image_urls(self, sku: int, pics_count: int, basket_str: str) -> str:
@@ -163,43 +206,6 @@ class AsyncWbParser:
         image_links = [
             f"{base_url}/{i}.webp" for i in range(1, pics_count + 1)]
         return ", ".join(image_links)
-
-    def extract_detail_info(self, detail_json: dict) -> dict:
-        if not detail_json:
-            return {}
-
-        description = detail_json.get("description", "")
-        country = "Не указано"
-        structured_data = []
-        for group in detail_json.get("grouped_options", []):
-            group_name = group.get("group_name")
-            options_list = []
-            for opt in group.get("options", []):
-                name = opt.get("name")
-                value = opt.get("value")
-                if name == 'Страна производства':
-                    country = value
-                options_list.append(f"{name}: {value}")
-
-            group_string = f"[{group_name}]\n" + "\n".join(options_list)
-            structured_data.append(group_string)
-
-        characteristics = "\n\n".join(structured_data)
-
-        return {
-            "description": description,
-            "characteristics": characteristics,
-            "country": country
-        }
-
-    async def _fetch_basket(self, url: str, basket_str: str) -> Tuple[Optional[dict], Optional[str]]:
-        try:
-            response = await self.client.get(url, timeout=1)
-            if response.status_code == 200:
-                return response.json(), basket_str
-        except Exception:
-            pass
-        return None, None
 
     def _get_basket_id(self, sku: int) -> str:
         vol = sku // 100000
@@ -249,32 +255,42 @@ class AsyncWbParser:
 async def main():
     parser = await AsyncWbParser.create()
     try:
-        raw_products = await parser.search_all_data(
-            "пальто из натуральной шерсти"
+        products = await parser.search_all_products(
+            "пальто из натуральной шерсти",
+            5
         )
-        logger.info(f"Найдено товаров: {len(raw_products)}")
+        logger.info(f"Найдено товаров: {len(products)}")
     except Exception as e:
         logger.error(f"Ошибка при поиске товаров: {e}")
         await parser.close()
         return
     try:
-        products = parser.extract_products(raw_products)
         semaphore = asyncio.Semaphore(20)
 
-        async def worker(p: dict):
+        async def worker(product: WBProduct):
             async with semaphore:
                 await asyncio.sleep(0.1)
-                detail_product, basket_str = await parser.get_detail_product(p['sku'])
-                if detail_product:
-                    p.update(parser.extract_detail_info(detail_product))
-                    p["image_urls"] = parser.generate_image_urls(
-                        p["sku"], p["pics_count"], basket_str)
+                detail, b_str = await parser.get_detail_product(product.sku)
+                if detail:
+                    product.generate_images(b_str)
+                    product.description = detail.description
+                    chars = []
+                    for group in detail.grouped_options:
+                        opts = [f"{o.name}: {o.value}" for o in group.options]
+                        if opts:
+                            chars.append(f"[{group.group_name}]\n" + "\n".join(opts))
+                            for o in group.options:
+                                if "Страна" in o.name:
+                                    product.country = o.value
+                    
+                    product.characteristics = "\n\n".join(chars)
         start = time.perf_counter()
-
         await tqdm.gather(*(worker(p) for p in products), desc="Обработка товаров", total=len(products))
         end = time.perf_counter()
         logger.info(f"Общее время выполнения: {end - start:.2f} секунд")
         logger.info(f'Обработано товаров: {len(products)}')
+        final_data = [p.to_excel_dict() for p in products]
+
     finally:
         await parser.close()
     column_mapping = {
@@ -293,7 +309,8 @@ async def main():
         "feedbacks": "Количество отзывов",
         "country": "Страна производства"
     }
-    df = pd.DataFrame(products).rename(columns=column_mapping)
+    df = pd.DataFrame(final_data).rename(columns=column_mapping)
+    print(df)
     col_to_export = list(column_mapping.values())
     df[col_to_export].to_excel("wb_detailed_data.xlsx", index=False)
     filtered_df = df[
@@ -301,8 +318,8 @@ async def main():
         (df["Цена"] <= 10000) &
         (df["Страна производства"].str.contains("Россия", case=False, na=False))
     ]
-
-    filtered_df[col_to_export].to_excel("filtered_catalog.xlsx", index=False)
+    if not filtered_df.empty:
+        filtered_df[col_to_export].to_excel("filtered_catalog.xlsx", index=False)
 
 
 if __name__ == "__main__":
