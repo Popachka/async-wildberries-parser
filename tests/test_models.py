@@ -1,7 +1,6 @@
 from wbparse_async import WBProduct, WBSize, WBPrice
 
 def test_wb_product_price_calc():
-    # Проверяем, что цена берется из первого доступного размера с остатком
     product = WBProduct(
         id=123,
         sizes=[
