@@ -1,5 +1,4 @@
 import json
-from playwright.async_api import async_playwright
 import logging
 import time
 import pandas as pd
@@ -8,6 +7,8 @@ import asyncio
 import httpx
 from typing import Optional, Tuple, Any
 from pydantic import BaseModel, Field, field_validator
+from seleniumbase import Driver
+from seleniumbase.core.sb_driver import DriverMethods
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.ERROR)
 
@@ -183,7 +184,7 @@ class AsyncWbParser:
     async def get_detail_product(self, sku: int) -> tuple[Optional[WBDetailProduct], str]:
         vol, part = sku // 100000, sku // 1000
         base_basket = self._get_basket_id(sku)
-        offsets = list(dict.fromkeys([i for j in range(15) for i in (j, -j)]))
+        offsets = [0, 1, -1, 2, -2]
 
         for offset in offsets:
             basket_str = f"{base_basket + offset:02d}"
@@ -207,7 +208,7 @@ class AsyncWbParser:
             f"{base_url}/{i}.webp" for i in range(1, pics_count + 1)]
         return ", ".join(image_links)
 
-    def _get_basket_id(self, sku: int) -> str:
+    def _get_basket_id(self, sku: int) -> int:
         vol = sku // 100000
         basket_ranges = [
             (0, 143, 1),
@@ -258,25 +259,21 @@ class AsyncWbParser:
 
     @staticmethod
     async def _get_token_static() -> Tuple[dict, str]:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                channel="chrome",
-                headless=False,
-                args=['--disable-blink-features=AutomationControlled']
-            )
-            context = await browser.new_context()
-            page = await context.new_page()
-            await page.goto(AsyncWbParser.URL, wait_until="networkidle")
+        driver: DriverMethods = Driver(uc=True, headed=True, headless=True)
+        try:
+            url = AsyncWbParser.URL
+            driver.uc_open_with_reconnect(url, reconnect_time=5)
+            
+            # Ждем появления куки или конкретного элемента, подтверждающего проход Cloudflare
+            driver.sleep(5) 
 
-            await page.wait_for_event("framenavigated")
-
-            cookies_list = await context.cookies()
+            cookies_list = driver.get_cookies()
             cookies = {c['name']: c['value'] for c in cookies_list}
-
-            user_agent = await page.evaluate("() => navigator.userAgent")
-
-            await browser.close()
+            user_agent = driver.get_user_agent()
+            
             return cookies, user_agent
+        finally:
+            driver.quit()
 
     async def _refresh_token(self):
         self.cookies, self.user_agent = await self._get_token_static()
